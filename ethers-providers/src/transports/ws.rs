@@ -16,16 +16,19 @@ use serde_json::value::RawValue;
 use std::{
     collections::{btree_map::Entry, BTreeMap},
     fmt::{self, Debug},
+    future::{Future},
+    pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
+    task::{Context, Poll},
 };
 use thiserror::Error;
+use tokio::task::JoinHandle;
 use tracing::trace;
 
 use super::common::{Params, Response};
-
 if_wasm! {
     use wasm_bindgen::prelude::*;
     use wasm_bindgen_futures::spawn_local;
@@ -203,10 +206,9 @@ impl PubsubClient for Ws {
     }
 }
 
-struct WsServer<S> {
+pub struct WsServer<S> {
     ws: Fuse<S>,
     instructions: Fuse<mpsc::UnboundedReceiver<Instruction>>,
-
     pending: BTreeMap<u64, Pending>,
     subscriptions: BTreeMap<U256, Subscription>,
 }
@@ -235,12 +237,10 @@ where
         self.instructions.is_done() && self.pending.is_empty() && self.subscriptions.is_empty()
     }
 
-    /// Spawns the event loop
-    fn spawn(mut self)
+    fn ws_server_task(mut self) ->  WsServerFuture<S>
     where
-        S: 'static,
-    {
-        let f = async move {
+    S: 'static, {
+        Box::pin(async move {
             loop {
                 if self.is_done() {
                     debug!("work complete");
@@ -249,15 +249,25 @@ where
                 match self.tick().await {
                     Err(ClientError::UnexpectedClose) => {
                         error!("{}", ClientError::UnexpectedClose);
-                        break
+                        return Err((self, ClientError::UnexpectedClose))
                     }
-                    Err(e) => {
-                        panic!("WS Server panic: {}", e);
+                    Err(err) => {
+                        error!("WS Server panic: {}", err);
+                        return Err((self, err))
                     }
                     _ => {}
                 }
             }
-        };
+            Ok(())
+        })
+    }
+
+    /// Spawns the event loop
+    fn spawn(self)
+    where
+        S: 'static,
+    {
+        let f = self.ws_server_task();
 
         #[cfg(target_arch = "wasm32")]
         spawn_local(f);
@@ -414,6 +424,31 @@ where
         };
 
         Ok(())
+    }
+}
+
+type WsServerOutput<S> = Result<(), (WsServer<S>, ClientError)>;
+type WsServerFuture<S> = Pin<Box<dyn Future<Output = WsServerOutput<S>> + Send + 'static>>;
+
+type WsServerHandleOutput<S> =
+    Result<Result<(), (WsServer<S>, ClientError)>, tokio::task::JoinError>;
+
+/// The future that awaits the spawned `WsServer` future
+#[pin_project::pin_project]
+pub struct WsServerHandle<S> {
+    #[pin]
+    inner: JoinHandle<WsServerOutput<S>>,
+}
+
+impl<S> Future for WsServerHandle<S>
+where
+    S: Send + Sync + Stream<Item = WsStreamItem> + Sink<Message, Error = WsError> + Unpin,
+{
+    type Output = WsServerHandleOutput<S>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        this.inner.poll(cx)
     }
 }
 
