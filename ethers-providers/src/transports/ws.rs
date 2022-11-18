@@ -29,6 +29,7 @@ use tokio::task::JoinHandle;
 use tracing::trace;
 
 use super::common::{Params, Response};
+
 if_wasm! {
     use wasm_bindgen::prelude::*;
     use wasm_bindgen_futures::spawn_local;
@@ -110,15 +111,28 @@ impl Debug for Ws {
 impl Ws {
     /// Initializes a new WebSocket Client, given a Stream/Sink Websocket implementer.
     /// The websocket connection must be initiated separately.
+    ///
+    /// See [`Ws::connect()`]
     pub fn new<S: 'static>(ws: S) -> Self
+    where
+        S: Send + Sync + Stream<Item = WsStreamItem> + Sink<Message, Error = WsError> + Unpin,
+    {
+        let (ws, _) = Self::new_pair(ws);
+        ws
+    }
+
+    /// Creates a new pair of `Ws` and `WsServerHandle`
+    pub fn new_pair<S: 'static>(ws: S) -> (Self, WsServerHandle<S>)
     where
         S: Send + Sync + Stream<Item = WsStreamItem> + Sink<Message, Error = WsError> + Unpin,
     {
         let (sink, stream) = mpsc::unbounded();
         // Spawn the server
-        WsServer::new(ws, stream).spawn();
-
-        Self { id: Arc::new(AtomicU64::new(1)), instructions: sink }
+        let server = WsServer::new(ws, stream).into_future();
+        let inner = tokio::task::spawn(async move { server.await });
+        let handle = WsServerHandle { inner };
+        let ws = Self { id: Arc::new(AtomicU64::new(1)), instructions: sink };
+        (ws, handle)
     }
 
     /// Returns true if the WS connection is active, false otherwise
@@ -135,10 +149,23 @@ impl Ws {
     }
 
     /// Initializes a new WebSocket Client
+    ///
+    /// ```
+    /// use ethers_providers::{Provider, Ws};
+    /// # async fn t() {
+    ///    let provider = Provider::new(Ws::connect("ws://localhost:8545").await.unwrap());
+    /// # }
+    /// ```
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn connect(url: impl IntoClientRequest + Unpin) -> Result<Self, ClientError> {
         let (ws, _) = connect_async(url).await?;
         Ok(Self::new(ws))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn create(url: impl IntoClientRequest + Unpin) -> Result<Self, ClientError> {
+        let (ws, _) = connect_async(url).await?;
+        todo!()
     }
 
     /// Initializes a new WebSocket Client with authentication
@@ -237,9 +264,12 @@ where
         self.instructions.is_done() && self.pending.is_empty() && self.subscriptions.is_empty()
     }
 
-    fn ws_server_task(mut self) ->  WsServerFuture<S>
+    /// Returns a new future that drives the websocket
+    #[must_use = "Future does nothing unless polled"]
+    pub fn into_future(mut self) -> WsServerFuture<S>
     where
-    S: 'static, {
+        S: 'static,
+    {
         Box::pin(async move {
             loop {
                 if self.is_done() {
@@ -267,7 +297,7 @@ where
     where
         S: 'static,
     {
-        let f = self.ws_server_task();
+        let f = self.into_future();
 
         #[cfg(target_arch = "wasm32")]
         spawn_local(f);
@@ -457,8 +487,8 @@ fn to_client_error<T: Debug>(err: T) -> ClientError {
     ClientError::ChannelError(format!("{:?}", err))
 }
 
-#[derive(Error, Debug)]
 /// Error thrown when sending a WS message
+#[derive(Error, Debug)]
 pub enum ClientError {
     /// Thrown if deserialization failed
     #[error(transparent)]
