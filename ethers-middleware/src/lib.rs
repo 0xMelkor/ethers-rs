@@ -36,3 +36,7 @@ pub use policy::PolicyMiddleware;
 /// before the chain tip
 pub mod timelag;
 pub use timelag::TimeLag;
+
+// TODO: Document
+pub mod typed_logs;
+pub use typed_logs::*;
